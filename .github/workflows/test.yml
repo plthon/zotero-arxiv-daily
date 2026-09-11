@@ -8,13 +8,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      #  with:
-      #    repository: ${{ vars.REPOSITORY }}
-      #    ref: ${{ vars.REF }}
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7.1.4
-
 
       - name: Run script
         env:
@@ -26,9 +22,108 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
+
+          # Legacy settings used before upstream migrated to CUSTOM_CONFIG.
+          ARXIV_QUERY: ${{ secrets.ARXIV_QUERY }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          MAX_PAPER_NUM: ${{ secrets.MAX_PAPER_NUM }}
+          MODEL_NAME: ${{ secrets.MODEL_NAME }}
+          SEND_EMPTY: ${{ vars.SEND_EMPTY }}
+          LANGUAGE: ${{ vars.LANGUAGE }}
+          ZOTERO_IGNORE: ${{ vars.ZOTERO_IGNORE }}
         run: |
           export DEBUG=true
-          printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
-          echo "Use custom config: "
+          if [ -n "$CUSTOM_CONFIG" ]; then
+            printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
+          else
+            echo "::warning::CUSTOM_CONFIG is not set; migrating legacy Actions settings at runtime."
+            python - <<'PY'
+          import json
+          import os
+
+          def value(name, default):
+              raw = os.getenv(name, "").strip()
+              return raw if raw else default
+
+          def as_bool(name, default=False):
+              raw = os.getenv(name, "").strip().lower()
+              if not raw:
+                  return default
+              return raw in {"1", "true", "yes", "on"}
+
+          arxiv_categories = [
+              item.strip()
+              for item in value("ARXIV_QUERY", "cs.AI+cs.CV+cs.LG+cs.CL").split("+")
+              if item.strip()
+          ]
+
+          ignore_patterns = [
+              line.strip()
+              for line in os.getenv("ZOTERO_IGNORE", "").splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          ]
+          negated_patterns = [p for p in ignore_patterns if p.startswith("!")]
+          ignore_patterns = [p for p in ignore_patterns if not p.startswith("!")]
+          if negated_patterns:
+              print(
+                  "::warning::Legacy ZOTERO_IGNORE negation patterns are not supported by "
+                  "the new glob-based config and were skipped: " + ", ".join(negated_patterns)
+              )
+
+          max_paper_raw = value("MAX_PAPER_NUM", "100")
+          try:
+              max_paper_num = int(max_paper_raw)
+          except ValueError:
+              print(f"::warning::Invalid MAX_PAPER_NUM={max_paper_raw!r}; using 100.")
+              max_paper_num = 100
+          max_paper_yaml = "null" if max_paper_num < 0 else str(max_paper_num)
+
+          smtp_port_raw = value("SMTP_PORT", "465")
+          try:
+              smtp_port = int(smtp_port_raw)
+          except ValueError:
+              print(f"::warning::Invalid SMTP_PORT={smtp_port_raw!r}; using 465.")
+              smtp_port = 465
+
+          config = f'''zotero:
+            user_id: ${{oc.env:ZOTERO_ID}}
+            api_key: ${{oc.env:ZOTERO_KEY}}
+            include_path: null
+            ignore_path: {json.dumps(ignore_patterns) if ignore_patterns else 'null'}
+
+          email:
+            sender: ${{oc.env:SENDER}}
+            receiver: ${{oc.env:RECEIVER}}
+            smtp_server: {json.dumps(value('SMTP_SERVER', 'smtp.qq.com'))}
+            smtp_port: {smtp_port}
+            sender_password: ${{oc.env:SENDER_PASSWORD}}
+
+          llm:
+            api:
+              key: ${{oc.env:OPENAI_API_KEY}}
+              base_url: ${{oc.env:OPENAI_API_BASE}}
+            api_mode: chat_completion
+            generation_kwargs:
+              model: {json.dumps(value('MODEL_NAME', 'gpt-4o'))}
+            language: {json.dumps(value('LANGUAGE', 'English'))}
+
+          source:
+            arxiv:
+              category: {json.dumps(arxiv_categories)}
+              include_cross_list: false
+
+          executor:
+            debug: ${{oc.env:DEBUG,null}}
+            send_empty: {str(as_bool('SEND_EMPTY')).lower()}
+            max_paper_num: {max_paper_yaml}
+            source: ['arxiv']
+          '''
+          with open("config/custom.yaml", "w", encoding="utf-8") as f:
+              f.write(config)
+          PY
+          fi
+
+          echo "Use custom config:"
           cat config/custom.yaml
           uv run src/zotero_arxiv_daily/main.py
